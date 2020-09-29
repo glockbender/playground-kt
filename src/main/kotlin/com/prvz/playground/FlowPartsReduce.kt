@@ -8,7 +8,27 @@ import kotlinx.coroutines.runBlocking
 import java.nio.ByteBuffer
 import kotlin.random.Random
 
+class A {
+    fun test() {
+        val bb = ByteBuffer.wrap(Random.nextBytes(105))
+        val ch = bb.chunked(10)
+        val bb1: ByteBuffer = ByteBuffer.allocate(105).apply {
+            ch.first.forEach { inn -> put(inn) }
+            put(ch.second!!)
+            rewind()
+        }
+
+        if (bb != bb1) {
+            throw IllegalStateException()
+        }
+
+        println()
+    }
+}
+
 fun main() {
+
+    A().test()
 
     val expectedList = mutableListOf<Byte>()
 
@@ -18,11 +38,12 @@ fun main() {
 
         var totalSize = 0
 
-        for (i in 0..1000) {
-            val bb = ByteBuffer.wrap(Random.nextBytes(Random.nextInt(1024, 1024 * 16)))
+        for (i in 0..10000) {
+            val bb = ByteBuffer.wrap(Random.nextBytes(Random.nextInt(1024 / 2, 1024 * 16)))
+            expectedList.addAll(bb.array().toTypedArray())
+            bb.rewind()
             emit(bb)
             totalSize += bb.capacity()
-            expectedList.addAll(bb.array().toTypedArray())
         }
 
         println("EXPECTED TOTAL SIZE: $totalSize")
@@ -33,50 +54,78 @@ fun main() {
 
     runBlocking {
         flow.resizeParts(
-            minPartSize = 2048 * 6,
-            maxPartSize = 2048 * 8
+            minPartSize = 2048,
+            maxPartSize = 2048 * 2
         ).withIndex()
             .let { flow ->
                 var totalSize = 0
                 flow.collect {
                     println("IDX: ${it.index}. SIZE: ${it.value.capacity()}")
+                    val checkList = expectedList.subList(totalSize, totalSize + it.value.capacity())
                     totalSize += it.value.capacity()
-                    actualList.addAll(it.value.array().toTypedArray())
+                    if (it.value.position() != 0) {
+                        throw IllegalStateException()
+                    }
+                    if (it.value.array().size != it.value.capacity()) {
+                        println("@@@ALARM@@@")
+                    }
+                    val addList = it.value.array().asList()
+                    if (checkList != addList) {
+                        println("±±±ALARM±±±")
+                    }
+                    actualList.addAll(addList)
                 }
                 println("TOTAL SIZE: $totalSize")
             }
 
     }
 
-    assert(expectedList == actualList)
+    println("EQUALS: ${expectedList == actualList}")
 }
 
-fun ByteBuffer.chunked(separatePartSize: Int): Pair<List<ByteBuffer>, ByteBuffer?> {
+fun ByteBuffer.chunked(chunkSize: Int): Pair<List<ByteBuffer>, ByteBuffer?> {
     val size = this.capacity()
-    if (size < separatePartSize) {
+    if (size < chunkSize) {
         return listOf<ByteBuffer>() to this
     }
 
-    val parts = size / separatePartSize
-    val remains = size % separatePartSize
+    val parts = size / chunkSize
+    val remains = size % chunkSize
 
     var startIdx = 0
 
     val fullPartsList = ArrayList<ByteBuffer>(parts)
 
     for (i in 1..parts) {
-        val partBytes = this.slice(startIdx, separatePartSize)
+        val partBytes = this.copyNoShare(startIdx, chunkSize)
         fullPartsList.add(partBytes)
-        startIdx += separatePartSize
+        startIdx += chunkSize
     }
 
     val lastPart = if (remains == 0) {
         null
     } else {
-        this.slice(startIdx, remains)
+        this.copyNoShare(startIdx, remains)
     }
 
     return fullPartsList to lastPart
+}
+
+fun ByteBuffer.concat(bb: ByteBuffer): ByteBuffer = ByteBuffer
+    .allocate(this.capacity() + bb.capacity())
+    .put(this)
+    .put(bb)
+    .rewind()
+
+fun ByteBuffer.copyNoShare(startIdx: Int, newSize: Int): ByteBuffer {
+    val copy = ByteBuffer.allocate(newSize)
+    val capacityWithIdx = startIdx + newSize
+    if (this.capacity() >= capacityWithIdx) {
+        copy.put(this.slice(startIdx, newSize))
+    } else {
+        copy.put(this)
+    }
+    return copy.rewind()
 }
 
 suspend fun Flow<ByteBuffer>.resizeParts(
@@ -87,57 +136,46 @@ suspend fun Flow<ByteBuffer>.resizeParts(
     val firstFlow = this@resizeParts
     var accumulatedBytes: ByteBuffer? = null
 
-    suspend fun whenLessThanMinPartSize(bb: ByteBuffer) {
-        if (accumulatedBytes == null) {
-            accumulatedBytes = bb
+    suspend fun accStage(received: ByteBuffer): ByteBuffer? {
+        val partToAddInAccSize = maxPartSize - accumulatedBytes!!.capacity()
+        return if (received.capacity() <= partToAddInAccSize) {
+            accumulatedBytes = accumulatedBytes!!.concat(received)
+            null
         } else {
-            val newAccumulatedSize = accumulatedBytes!!.capacity() + bb.capacity()
-            if (newAccumulatedSize <= maxPartSize) {
-                accumulatedBytes = accumulatedBytes!!.put(bb)
-            } else {
-                if (accumulatedBytes!!.capacity() >= minPartSize) {
-                    emit(accumulatedBytes!!)
-                    accumulatedBytes = bb
-                } else {
-                    val receivedBytesSizeLimit = maxPartSize - accumulatedBytes!!.capacity()
-                    val bytesToEmit = accumulatedBytes!!
-                        .put(bb.slice(0, receivedBytesSizeLimit))
-                    accumulatedBytes = bb.slice(receivedBytesSizeLimit, bb.capacity() - receivedBytesSizeLimit)
-                    emit(bytesToEmit)
-                }
-            }
-        }
-    }
-
-    suspend fun whenMoreThanMaxPartSize(bb: ByteBuffer) {
-        val remain: ByteBuffer
-        if (accumulatedBytes != null) {
-            // bytes need to be added to accumulated bytes array for growing up to maxPartSize
-            val bytesToAddToAccBytes = maxPartSize - accumulatedBytes!!.capacity()
-            accumulatedBytes = accumulatedBytes!!.put(bb.slice(0, bytesToAddToAccBytes))
-            emit(accumulatedBytes!!)
+            val receivedBytesToAddInAcc = received.slice(0, partToAddInAccSize)
+            emit(accumulatedBytes!!.concat(receivedBytesToAddInAcc))
             accumulatedBytes = null
-            remain = bb.slice(bytesToAddToAccBytes, bb.capacity() - bytesToAddToAccBytes)
-        } else {
-            remain = bb
+            val remains = received.copyNoShare(partToAddInAccSize, received.capacity() - partToAddInAccSize)
+            remains
         }
-        val chunked = remain.chunked(maxPartSize)
-        if (chunked.first.isNotEmpty()) {
-            chunked.first.forEach { part -> emit(part) }
-        }
-        accumulatedBytes = chunked.second
     }
 
-    firstFlow.collect {
-        val receivedSize = it.capacity()
+    suspend fun nextStage(received: ByteBuffer) {
         when {
-            receivedSize < minPartSize -> whenLessThanMinPartSize(it)
-            receivedSize > maxPartSize -> whenMoreThanMaxPartSize(it)
+            received.capacity() < minPartSize -> {
+                accumulatedBytes = received
+            }
+            received.capacity() > maxPartSize -> {
+                val chunked = received.chunked(maxPartSize)
+                if (chunked.first.isNotEmpty()) {
+                    chunked.first.forEach { part -> emit(part) }
+                }
+                accumulatedBytes = chunked.second
+            }
             else -> {
-                emit(it)
+                emit(received)
             }
         }
     }
+
+    firstFlow
+        .collect { received ->
+            if (accumulatedBytes != null) {
+                accStage(received)?.let { nextStage(it) }
+            } else {
+                nextStage(received)
+            }
+        }
 
     accumulatedBytes?.let { emit(it) }
 }
