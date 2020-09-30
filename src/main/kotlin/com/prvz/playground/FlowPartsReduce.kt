@@ -136,44 +136,39 @@ suspend fun Flow<ByteBuffer>.resizeParts(
     val firstFlow = this@resizeParts
     var accumulatedBytes: ByteBuffer? = null
 
-    suspend fun accStage(received: ByteBuffer): ByteBuffer? {
-        val partToAddInAccSize = maxPartSize - accumulatedBytes!!.capacity()
-        return if (received.capacity() <= partToAddInAccSize) {
-            accumulatedBytes = accumulatedBytes!!.concat(received)
-            null
-        } else {
-            val receivedBytesToAddInAcc = received.slice(0, partToAddInAccSize)
-            emit(accumulatedBytes!!.concat(receivedBytesToAddInAcc))
-            accumulatedBytes = null
-            val remains = received.copyNoShare(partToAddInAccSize, received.capacity() - partToAddInAccSize)
-            remains
-        }
-    }
-
-    suspend fun nextStage(received: ByteBuffer) {
-        when {
-            received.capacity() < minPartSize -> {
-                accumulatedBytes = received
-            }
-            received.capacity() > maxPartSize -> {
-                val chunked = received.chunked(maxPartSize)
-                if (chunked.first.isNotEmpty()) {
-                    chunked.first.forEach { part -> emit(part) }
-                }
-                accumulatedBytes = chunked.second
-            }
-            else -> {
-                emit(received)
-            }
-        }
-    }
-
     firstFlow
         .collect { received ->
-            if (accumulatedBytes != null) {
-                accStage(received)?.let { nextStage(it) }
-            } else {
-                nextStage(received)
+            val remainsReceived: ByteBuffer? =
+                if (accumulatedBytes != null) {
+                    val partToAddInAccSize = maxPartSize - accumulatedBytes!!.capacity()
+                    if (received.capacity() <= partToAddInAccSize) {
+                        accumulatedBytes = accumulatedBytes!!.concat(received)
+                        null
+                    } else {
+                        val receivedBytesToAddInAcc = received.slice(0, partToAddInAccSize)
+                        emit(accumulatedBytes!!.concat(receivedBytesToAddInAcc))
+                        accumulatedBytes = null
+                        received.copyNoShare(partToAddInAccSize, received.capacity() - partToAddInAccSize)
+                    }
+                } else {
+                    received
+                }
+            remainsReceived?.let {
+                when {
+                    it.capacity() < minPartSize -> {
+                        accumulatedBytes = it
+                    }
+                    it.capacity() > maxPartSize -> {
+                        val chunked = it.chunked(maxPartSize)
+                        if (chunked.first.isNotEmpty()) {
+                            chunked.first.forEach { part -> emit(part) }
+                        }
+                        accumulatedBytes = chunked.second
+                    }
+                    else -> {
+                        emit(it)
+                    }
+                }
             }
         }
 
